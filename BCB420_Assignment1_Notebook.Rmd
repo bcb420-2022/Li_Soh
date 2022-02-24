@@ -1,0 +1,330 @@
+---
+title: "BCB420 Assignment 1 Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+__Part 1: Getting the dataset ready. Cleaning the data and mapping to HGNC__
+
+
+Downloading the data of GSE178521. Providing some metadata of the platform and 
+dataset. 
+
+```{r}
+require(GEOquery)
+gse <- getGEO("GSE178521", GSEMatrix=FALSE)
+
+#Information about Platform
+current_gpl <- names(GPLList(gse))[1]
+current_gpl_info <- Meta(getGEO(current_gpl))
+
+```
+
+**Metadata of the series**
+
+`r knitr::kable(data.frame(head(Meta(gse))), format = "html")`
+
+<br />
+
+**Information about the platform - GPL24676**
+
+
+**Platform title** : `r current_gpl_info$title` 
+
+**Submission data** : `r current_gpl_info$submission_date`
+
+**Last update data** : `r current_gpl_info$last_update_date`
+
+**Organims** : `r current_gpl_info$organism` (taxid: `r current_gpl_info$taxid`) 
+
+**Number of GEO datasets that use this techology** : `r length(current_gpl_info$series_id)`  
+
+**Number of GEO samples that use this technology** : `r length(current_gpl_info$sample_id)`
+
+
+
+Get the expression data and displaying information about it.
+```{r}
+sfiles = getGEOSuppFiles("GSE178521")
+fnames = rownames(sfiles)
+PRMT5_exp = read.delim(fnames[1],header=TRUE,
+                       check.names = FALSE)
+
+#Information
+read.table(fnames[1],header=TRUE,
+           check.names = FALSE)[1,]
+knitr::kable(PRMT5_exp[1:15,1:6], format = "html")
+
+#How many genes do we have measurement for?
+dim(PRMT5_exp)
+colnames(PRMT5_exp)
+```
+**Brief overview of the dataset up to 15 genes**
+
+`r knitr::kable(PRMT5_exp[1:15,], format = "html")`
+
+<br />
+
+Since our original dataset does not provide the gene symbol, we will need to map
+the ensemble ID to HUGO gene symbol using the library EnsDb.Hsapiens.v79
+```{r}
+#Convert ensemble ID to gene symbols in R
+#Making sure all dependencies are installed
+BiocManager::install("EnsDb.Hsapiens.v79")
+library("EnsDb.Hsapiens.v79")
+require("ensembldb")
+BiocManager::install("ensembldb")
+geneID_mapping <- ensembldb::select(EnsDb.Hsapiens.v79, 
+                                           keys=PRMT5_exp$gene_id,
+                                           keytype="GENEID", 
+                                           columns = c("SYMBOL","GENEID"))
+symbol <- c() #create empty vector
+for(i in PRMT5_exp$gene_id){
+  if(!(i %in% geneID_mapping$GENEID)){symbol <- c(symbol, NA)}
+  else{symbol <- c(symbol, geneID_mapping$SYMBOL[which(geneID_mapping$GENEID == i)])}
+  
+}
+PRMT5_exp$HUGO_symbol <- symbol #add the gene symbols to the dataset as a column
+```
+
+Next, we will get the summarized gene count.
+```{r}
+summarized_gene_counts <- sort(table(PRMT5_exp$HUGO_symbol),
+                               decreasing = TRUE)
+knitr::kable(summarized_gene_counts[which(summarized_gene_counts>1)[1:10]], 
+             format="html")
+```
+
+**Result**: 
+
+`r knitr::kable(summarized_gene_counts[which(summarized_gene_counts>1)[1:10]], format="html")`
+
+<br />
+
+We will now define the groups: Control (GFP) vs Experimental (PRMT5). Tere are 
+3 samples for each group
+
+```{r}
+#Define the groups
+samples <- data.frame(lapply(colnames(PRMT5_exp)[2:7], 
+                             FUN=function(x){unlist(strsplit(x, split = "kd"))}))
+
+colnames(samples) <- colnames(PRMT5_exp)[2:7]
+rownames(samples) <- c("Replicates", "Experimental_Group")
+samples <- data.frame(t(samples))
+```
+
+Next, we want to translate out the counts into count per million (cpm) and get 
+rid of low counts.
+
+```{r}
+#Translate out counts into count per million using edgeR
+cpms = edgeR::cpm(PRMT5_exp[,2:7])
+rownames(cpms) <- PRMT5_exp[,1]
+
+#Get rid of low counts
+keep = rowSums(cpms >1) >=3 # n=3, 3 samples per group
+
+PRMT5_exp_filtered = PRMT5_exp[keep,]
+dim(PRMT5_exp_filtered) # first col is the number of remaining genes
+```
+
+We also want to check the percentage of the data in which the ensemble ID could 
+not be mapped to HGNC.
+
+```{r}
+#Find percentage of unmapped genes
+unmapped_percentage <-sum(is.na(PRMT5_exp_filtered$HUGO_symbol))/
+  length(PRMT5_exp_filtered$HUGO_symbol)*100
+
+#Remove any rows with NA in their HUGO_symbol
+PRMT5_exp_filtered <- na.omit(PRMT5_exp_filtered)
+
+#Just double checking if there are any NA left!
+any(is.na(PRMT5_exp_filtered$HUGO_symbol))
+```
+
+Since only `r unmapped_percentage`% of our data is unmapped, we can safely 
+filter out the data points (rows) that contain NA in their gene symbol.
+
+
+We then check if removing genes with low count solve the duplication issue
+```{r}
+summarized_gene_counts_filtered <- sort(table(PRMT5_exp_filtered$HUGO_symbol),
+                                        decreasing = TRUE)
+knitr::kable(summarized_gene_counts_filtered[
+  which(summarized_gene_counts>1)[1:10]], 
+  format="html")
+```
+
+**Result**:
+
+`r knitr::kable(summarized_gene_counts_filtered[ which(summarized_gene_counts>1)[1:10]], format="html")`
+
+<br />
+
+It seems that filtering out the low count does indeed solve some duplication
+issue. We have cleaned up our data and will now move on to normalize it.
+
+
+
+
+
+__Part 2: Normalization of data__
+
+We proceed to normalize the data using TMM and compare the box plot and density
+plot between the original count and normalized count.
+
+
+Normalization using TMM since our data distribution is closest to normal.
+```{r}
+library(edgeR)
+#Creating an edgeR container for RNASep count data
+filtered_data_matrix <- as.matrix(PRMT5_exp_filtered[,2:7])
+rownames(filtered_data_matrix) <- PRMT5_exp_filtered$HUGO_symbol
+#d is an edgeR object
+d = DGEList(counts = filtered_data_matrix, group = samples$Experimental_Group)
+
+#Calculuate the normalization factors
+d = calcNormFactors(d)
+normalized_counts <- cpm(d)
+```
+
+Visualize with boxplot
+```{r}
+#Boxplot
+par(mfrow=c(1,2))
+#Distribution of our original data - Boxplot
+data2plot <- log2(edgeR::cpm(PRMT5_exp_filtered[,2:7]))
+boxplot(data2plot, xlab = "Samples", ylab = "log2 CPM", 
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5, main = "Original Count")
+
+#draw the median on each box plot
+abline(h = median(apply(data2plot, 2, median)), 
+       col = "red", lwd = 0.6, lty = "dashed")
+
+################################################################################
+
+#Boxplot for normalized counts
+data2plot_normalized <- log2(normalized_counts)
+boxplot(data2plot_normalized, xlab = "Samples", ylab = "log2 CPM", 
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5, main = "Normalized")
+
+abline(h = median(apply(data2plot_normalized, 2, median)), 
+       col = "red", lwd = 0.6, lty = "dashed")
+```
+
+Result:
+![Boxplot](https://i.imgur.com/LMpiVy9.png "Boxplot")
+
+
+
+
+Visualize with density plot
+```{r}
+par(mfrow=c(1,2))
+#Density Plot for original count data
+counts_density <- apply(log2(edgeR::cpm(PRMT5_exp_filtered[,2:7])), 2, density)
+
+#Calculate the limits across all the samples
+xlim <- 0; ylim <- 0
+for (i in 1:length(counts_density)) {
+  xlim <- range(c(xlim, counts_density[[i]]$x)); 
+  ylim <- range(c(ylim, counts_density[[i]]$y))
+}
+cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+#plot the first density plot to initialize the plot
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n", 
+     ylab="Smoothing density of log2-CPM", main="Original Count", cex.lab = 0.8)
+#plot each line
+for (i in 1:length(counts_density)) lines(counts_density[[i]], col=cols[i])
+#create legend
+legend("topright", colnames(data2plot),  
+       col=cols, lty=ltys, cex=0.5, 
+       border ="blue",  text.col = "green4", 
+       merge = TRUE, bg = "gray90")
+
+##############################################################################
+
+#Density Plot for normalized count data
+norm_counts_density <- apply(log2(normalized_counts), 2, density)
+xlim <- 0; ylim <- 0
+for (i in 1:length(norm_counts_density)) {
+  xlim <- range(c(xlim, norm_counts_density[[i]]$x)); 
+  ylim <- range(c(ylim, norm_counts_density[[i]]$y))
+}
+cols <- rainbow(length(norm_counts_density))
+ltys <- rep(1, length(norm_counts_density))
+plot(norm_counts_density[[1]], xlim=xlim, ylim=ylim, type="n", 
+     ylab="Smoothing density of log2-CPM", main="Normalized count", cex.lab = 0.8)
+for (i in 1:length(norm_counts_density)) lines(norm_counts_density[[i]], col=cols[i])
+legend("topright", colnames(data2plot_normalized),  
+       col=cols, lty=ltys, cex=0.5, 
+       border ="blue",  text.col = "green4", 
+       merge = TRUE, bg = "gray90")
+```
+
+Result:
+![Density plot](https://i.imgur.com/w5fLqPB.png "Density plot")
+
+
+From the looks of it, the original count and normalized count graphs did not
+differ by much, which is a good sign as it means there is not much technical
+variation.
+
+Finally, we will check the MDS plot, which measure the distance between samples.
+
+```{r}
+#MDS plot: distance between samples
+plotMDS(d, labels=rownames(samples),
+        col = c("darkgreen","blue")[factor(samples$Experimental_Group)])
+```
+
+![MDS](https://i.imgur.com/Z1ASxpD.png "MDS")
+
+Conclusion from MDS plot: The strength of our result should be decent since 
+there is clear separation between control and experimental groups. There is a 
+slight clustering for the experimental group (PRMT5 replicates).
+
+
+<br />
+
+__Part 3: Interpretation__
+
+I am interested in this dataset because it elucidates the mechanism and
+involvement of a key protein PRMT5 in the immune response for lung cancer
+patients. This research can provide me insights into whether PRMT5 inhibition,
+in combination with other treament, can be a strategy for lung cancer treatment.
+
+The experiment involves 6 biological replicates (3 for each group) cultivated 
+from lung adenocarcinoma cell lines. The control group is the GFP-expressed 
+shRNA cells while the experimental group is the PRMT5-expressed shRNA cells.
+
+As stated above in the overview of the data analysis, some of the expression
+values could not be mapped to current HUGO symbols and are thus safely removed
+since these unmapped values only account for 0.86% of the filtered data. I also
+get rid of genes with low counts. This helped with duplication issue. 
+
+My dataset is monitoring the expression of approximately 15000 genes, so I can
+conclude that it has good coverage.
+
+<br />
+<br />
+<br />
+<br />
+<br />
+<br />
+<br />
+<br />
+<br />
+<br />
+
+
+
+
+
+
